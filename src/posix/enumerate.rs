@@ -110,6 +110,21 @@ fn udev_restore_spaces(source: String) -> String {
 }
 
 #[cfg(all(target_os = "linux", not(target_env = "musl"), feature = "libudev"))]
+fn device_location(d: &libudev::Device) -> String {
+    match d.devpath() {
+        Some(path) => path
+            .to_str()
+            .unwrap_or_default()
+            .split("/")
+            .take(8)
+            .last()
+            .unwrap_or_default()
+            .to_string(),
+        None => "".to_string(),
+    }
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "musl"), feature = "libudev"))]
 fn port_type(d: &libudev::Device) -> Result<SerialPortType> {
     match d.property_value("ID_BUS").and_then(OsStr::to_str) {
         Some("usb") => {
@@ -123,12 +138,26 @@ fn port_type(d: &libudev::Device) -> Result<SerialPortType> {
             let product =
                 udev_property_encoded_or_replaced_as_string(d, "ID_MODEL_ENC", "ID_MODEL")
                     .or_else(|| udev_property_as_string(d, "ID_MODEL_FROM_DATABASE"));
+
+            let location = device_location(d);
+            let [busnum, path] = location.split("-");
+            let port_chain = path
+                .filter(|p| p != "0") // root hub should be empty but devpath is 0
+                .and_then(|p| {
+                    p.split('.')
+                        .map(|v| v.parse::<u8>().ok())
+                        .collect::<Option<Vec<u8>>>()
+                })
+                .unwrap_or_default();
+
             Ok(SerialPortType::UsbPort(UsbPortInfo {
                 vid: udev_hex_property_as_int(d, "ID_VENDOR_ID", &u16::from_str_radix)?,
                 pid: udev_hex_property_as_int(d, "ID_MODEL_ID", &u16::from_str_radix)?,
                 serial_number,
                 manufacturer,
                 product,
+                bus_id: format!("{busnum:03}"),
+                port_chain,
                 #[cfg(feature = "usbportinfo-interface")]
                 interface: udev_hex_property_as_int(d, "ID_USB_INTERFACE_NUM", &u8::from_str_radix)
                     .ok(),
@@ -154,12 +183,26 @@ fn port_type(d: &libudev::Device) -> Result<SerialPortType> {
                     "ID_USB_MODEL_ENC",
                     "ID_USB_MODEL",
                 );
+
+                let location = device_location(d);
+                let [busnum, path] = location.split("-");
+                let port_chain = path
+                    .filter(|p| p != "0") // root hub should be empty but devpath is 0
+                    .and_then(|p| {
+                        p.split('.')
+                            .map(|v| v.parse::<u8>().ok())
+                            .collect::<Option<Vec<u8>>>()
+                    })
+                    .unwrap_or_default();
+
                 Ok(SerialPortType::UsbPort(UsbPortInfo {
                     vid: udev_hex_property_as_int(d, "ID_USB_VENDOR_ID", &u16::from_str_radix)?,
                     pid: udev_hex_property_as_int(d, "ID_USB_MODEL_ID", &u16::from_str_radix)?,
                     serial_number: udev_property_as_string(d, "ID_USB_SERIAL_SHORT"),
                     manufacturer,
                     product,
+                    bus_id: format!("{busnum:03}"),
+                    port_chain,
                     #[cfg(feature = "usbportinfo-interface")]
                     interface: udev_hex_property_as_int(
                         d,
@@ -252,6 +295,8 @@ fn parse_modalias(moda: &str) -> Option<UsbPortInfo> {
         serial_number: None,
         manufacturer: None,
         product: None,
+        bus_id: "".to_string(),
+        port_chain: vec![],
         // Only attempt to find the interface if the feature is enabled.
         #[cfg(feature = "usbportinfo-interface")]
         interface: mod_tail.get(pid_start + 4..).and_then(|mod_tail| {
@@ -344,6 +389,23 @@ fn get_string_property(device_type: io_registry_entry_t, property: &str) -> Resu
         .ok_or(Error::new(ErrorKind::Unknown, "Failed to get string value"))
 }
 
+/// Parse location_id by extracting bits that represent specific parts of
+/// the USB device’s location within the USB topology, such as the bus and
+/// port numbers,
+/// Returns port chain as a vector of u8 bytes.
+fn parse_location_id(id: u32) -> Vec<u8> {
+    let mut chain = vec![];
+    let mut shift = id << 8;
+
+    while shift != 0 {
+        let port = shift >> 28;
+        chain.push(port as u8);
+        shift = shift << 4;
+    }
+
+    chain
+}
+
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 /// Determine the serial port type based on the service object (like that returned by
 /// `IOIteratorNext`). Specific properties are extracted for USB devices.
@@ -355,12 +417,15 @@ fn port_type(service: io_object_t) -> SerialPortType {
     let maybe_usb_device = get_parent_device_by_type(service, usb_device_class_name)
         .or_else(|| get_parent_device_by_type(service, legacy_usb_device_class_name));
     if let Some(usb_device) = maybe_usb_device {
+        let location_id = get_int_property(usb_device, "locationID").unwrap_or_default() as u32;
         SerialPortType::UsbPort(UsbPortInfo {
             vid: get_int_property(usb_device, "idVendor").unwrap_or_default() as u16,
             pid: get_int_property(usb_device, "idProduct").unwrap_or_default() as u16,
             serial_number: get_string_property(usb_device, "USB Serial Number").ok(),
             manufacturer: get_string_property(usb_device, "USB Vendor Name").ok(),
             product: get_string_property(usb_device, "USB Product Name").ok(),
+            bus_id: format!("{:02x}", (location_id >> 24) as u8),
+            port_chain: parse_location_id(location_id),
             // Apple developer documentation indicates `bInterfaceNumber` is the supported key for
             // looking up the composite usb interface id. `idVendor` and `idProduct` are included in the same tables, so
             // we will lookup the interface number using the same method. See:
